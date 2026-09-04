@@ -1,0 +1,30 @@
+# Entorno virtual de Python
+venv/
+__pycache__/
+*.pyc
+
+# Base de datos vectorial (se regenera con `make index`)
+chroma_db/
+
+# Documentos personales (no subir PDFs privados al repo público)
+documentos/*
+!documentos/.gitkeep
+
+# Audio temporal generado en tiempo de ejecución
+*.wav
+
+# Archivos temporales de texto usados por el TTS
+texto_para_hablar.txt
+
+# Configuración de entrenamiento (si conservas algo del experimento de wake word)
+my_model.yaml
+
+# Variables de entorno / secretos, por si algún día agregas API keys
+.env
+
+# Archivos de sistema
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
