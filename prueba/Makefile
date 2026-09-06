@@ -24,8 +24,6 @@ install-system:
 	@echo "Instalando dependencias del sistema..."
 	sudo apt-get update
 	sudo apt-get install -y $(PYTHON) $(PYTHON)-venv git curl espeak-ng portaudio19-dev
-	@echo "Instalando dependencias de Qt (interfaz gráfica del orbe)..."
-	sudo apt-get install -y libxcb-cursor0 libxkbcommon-x11-0
 	@if ! command -v ollama >/dev/null 2>&1; then \
 		echo "Instalando Ollama..."; \
 		curl -fsSL https://ollama.com/install.sh | sh; \
@@ -57,10 +55,7 @@ index:
 	fi
 
 run:
-	@echo "Si usas Linux con Wayland y el orbe no se comporta bien (no se puede"
-	@echo "arrastrar, no queda encima de otras ventanas), corre en su lugar:"
-	@echo "  QT_QPA_PLATFORM=xcb make run"
-	$(PY) asistente.py
+	$(PY) main_rag_kokoro.py
 
 clean:
 	rm -rf $(VENV)

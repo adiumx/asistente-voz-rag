@@ -1,96 +1,178 @@
 """
-Consulta la base vectorial de PDFs y genera una respuesta coherente
-usando Gemma 3 (vía Ollama), citando de qué documento/página viene
-la información.
+Búsqueda semántica sobre los PDFs indexados + generación de respuesta con Gemma.
+
+Cambios respecto a la versión anterior:
+- `preguntar()` ahora devuelve (texto, fuentes) por separado, para que la voz
+  nunca lea las fuentes pero la UI sí las pueda mostrar.
+- Prompt con personalidad y respuestas cortas (pensadas para ser habladas).
+- Memoria conversacional corta, para poder hacer preguntas de seguimiento.
 """
 
+import os
 import chromadb
 import ollama
 
 CARPETA_DB = "./chroma_db"
 COLECCION = "pdfs"
 EMBED_MODEL = "nomic-embed-text"
-LLM_MODEL = "gemma3:4b" #LLM_MODEL = "gemma3:12b"
-N_RESULTADOS = 4  # cuántos fragmentos relevantes recuperar por pregunta
+
+# Configurable por entorno: en la 3060 usa gemma3:4b, en la V100 gemma3:12b
+LLM_MODEL = os.environ.get("RAG_LLM_MODEL", "gemma3:4b")
+
+N_RESULTADOS = 4
+MAX_TURNOS_MEMORIA = 3  # cuántos intercambios previos recuerda
+
+NOMBRE_ASISTENTE = "Morito"
+
+PERSONALIDAD = f"""Te llamas {NOMBRE_ASISTENTE}. Eres un asistente de voz que responde
+preguntas sobre los documentos de la persona con la que hablas.
+
+Cómo eres:
+- Cercano y directo, con un tono relajado pero profesional. Hablas español de México.
+- Breve: tus respuestas se escuchan en voz alta, así que van de 1 a 3 frases.
+  Solo te extiendes si te piden explícitamente más detalle.
+- Nunca inventas. Si algo no está en el contexto, lo dices sin rodeos y ofreces
+  lo que sí puedes responder.
+- Ocasionalmente tienes un toque de humor seco, pero nunca a costa de la claridad.
+
+Reglas de formato (importantes, porque te van a leer en voz alta):
+- Escribe en prosa natural. Nada de viñetas, asteriscos, guiones de lista ni markdown.
+- No menciones nombres de archivos, páginas ni "según el documento". Esa parte se
+  muestra aparte en pantalla. Tú solo responde el contenido.
+- Escribe los números y símbolos como se pronuncian (por ejemplo "aproximadamente cien"
+  en lugar de "~100").
+"""
 
 
-def obtener_coleccion():
-    client = chromadb.PersistentClient(path=CARPETA_DB)
-    return client.get_or_create_collection(COLECCION)
+class MotorRAG:
+    """Encapsula la colección y la memoria de la conversación."""
 
+    def __init__(self, carpeta_db=CARPETA_DB, coleccion=COLECCION):
+        self.client = chromadb.PersistentClient(path=carpeta_db)
+        self.coleccion = self.client.get_or_create_collection(coleccion)
+        self.historial = []  # [(pregunta, respuesta), ...]
 
-def buscar_contexto(pregunta, coleccion, n=N_RESULTADOS):
-    """Busca los fragmentos más relevantes para la pregunta."""
-    respuesta = ollama.embeddings(model=EMBED_MODEL, prompt=pregunta)
-    embedding_pregunta = respuesta["embedding"]
+    def contar(self):
+        return self.coleccion.count()
 
-    resultados = coleccion.query(
-        query_embeddings=[embedding_pregunta],
-        n_results=n
-    )
+    def limpiar_memoria(self):
+        self.historial = []
 
-    fragmentos = []
-    for doc, meta in zip(resultados["documents"][0], resultados["metadatas"][0]):
-        fragmentos.append({
-            "texto": doc,
-            "archivo": meta["archivo"],
-            "pagina": meta["pagina"],
-        })
-    return fragmentos
+    def buscar_contexto(self, pregunta, n=N_RESULTADOS):
+        emb = ollama.embeddings(model=EMBED_MODEL, prompt=pregunta)["embedding"]
+        res = self.coleccion.query(query_embeddings=[emb], n_results=n)
 
+        if not res["documents"] or not res["documents"][0]:
+            return []
 
-def construir_prompt(pregunta, fragmentos):
-    contexto = "\n\n".join(
-        f"[Fuente: {f['archivo']}, página {f['pagina']}]\n{f['texto']}"
-        for f in fragmentos
-    )
+        fragmentos = []
+        for doc, meta in zip(res["documents"][0], res["metadatas"][0]):
+            fragmentos.append({
+                "texto": doc,
+                "archivo": meta.get("archivo", "desconocido"),
+                "pagina": meta.get("pagina", "?"),
+            })
+        return fragmentos
 
-    prompt = f"""Eres un asistente que responde preguntas basándote ÚNICAMENTE en el contexto proporcionado.
-Si la respuesta no está en el contexto, di claramente que no tienes esa información en los documentos.
-Responde en español, de forma clara y directa, en prosa natural sin usar viñetas, asteriscos, ni símbolos especiales.
-Cuando sea relevante, menciona de qué documento sacaste la información de forma natural dentro del texto, no entre paréntesis.
+    def _construir_prompt(self, pregunta, fragmentos):
+        contexto = "\n\n".join(
+            f"--- Fragmento {i+1} ---\n{f['texto']}"
+            for i, f in enumerate(fragmentos)
+        )
 
-Contexto:
+        memoria = ""
+        if self.historial:
+            turnos = self.historial[-MAX_TURNOS_MEMORIA:]
+            memoria = "\nConversación reciente (para entender preguntas de seguimiento):\n"
+            memoria += "\n".join(f"Persona: {p}\nTú: {r}" for p, r in turnos)
+            memoria += "\n"
+
+        return f"""{PERSONALIDAD}
+{memoria}
+Contexto extraído de los documentos:
 {contexto}
 
 Pregunta: {pregunta}
 
-Respuesta:"""
-    return prompt
+Tu respuesta (1 a 3 frases, en prosa, sin mencionar archivos ni páginas):"""
+
+    def preguntar(self, pregunta):
+        """
+        Devuelve (texto_respuesta, lista_de_fuentes).
+        `fuentes` es una lista de dicts {archivo, pagina} sin duplicados.
+        """
+        fragmentos = self.buscar_contexto(pregunta)
+
+        if not fragmentos:
+            texto = ("No encontré nada sobre eso en tus documentos. "
+                     "¿Quieres preguntarme otra cosa?")
+            self.historial.append((pregunta, texto))
+            return texto, []
+
+        prompt = self._construir_prompt(pregunta, fragmentos)
+
+        try:
+            respuesta = ollama.generate(
+                model=LLM_MODEL,
+                prompt=prompt,
+                options={"temperature": 0.6, "num_predict": 220},
+            )
+            texto = respuesta["response"].strip()
+        except Exception as e:
+            return f"No pude generar la respuesta. Error: {e}", []
+
+        # Fuentes únicas, preservando el orden de relevancia
+        vistas = set()
+        fuentes = []
+        for f in fragmentos:
+            clave = (f["archivo"], f["pagina"])
+            if clave not in vistas:
+                vistas.add(clave)
+                fuentes.append({"archivo": f["archivo"], "pagina": f["pagina"]})
+
+        self.historial.append((pregunta, texto))
+        return texto, fuentes
 
 
-def preguntar(pregunta, coleccion=None, mostrar_fuentes=True):
-    if coleccion is None:
-        coleccion = obtener_coleccion()
+# --- Compatibilidad con los scripts anteriores ---
 
-    fragmentos = buscar_contexto(pregunta, coleccion)
+_motor_global = None
 
-    if not fragmentos:
-        return "No encontré información relevante en los documentos indexados."
 
-    prompt = construir_prompt(pregunta, fragmentos)
+def obtener_coleccion():
+    global _motor_global
+    if _motor_global is None:
+        _motor_global = MotorRAG()
+    return _motor_global
 
-    respuesta = ollama.generate(model=LLM_MODEL, prompt=prompt)
-    texto_respuesta = respuesta["response"].strip()
 
-    if mostrar_fuentes:
-        fuentes = sorted(set(f"{f['archivo']} (pág. {f['pagina']})" for f in fragmentos))
-        texto_respuesta += "\n\nFuentes: " + ", ".join(fuentes)
-
-    return texto_respuesta
+def preguntar(pregunta, motor=None, mostrar_fuentes=False):
+    motor = motor or obtener_coleccion()
+    texto, fuentes = motor.preguntar(pregunta)
+    if mostrar_fuentes and fuentes:
+        etiquetas = ", ".join(f"{f['archivo']} (p. {f['pagina']})" for f in fuentes)
+        texto += f"\n\nFuentes: {etiquetas}"
+    return texto
 
 
 if __name__ == "__main__":
-    coleccion = obtener_coleccion()
-    print(f"Documentos indexados: {coleccion.count()} fragmentos\n")
+    motor = MotorRAG()
+    print(f"Documentos indexados: {motor.contar()} fragmentos\n")
+    print("Escribe tu pregunta (o 'salir')\n")
 
-    print("Escribe tu pregunta (o 'salir' para terminar)\n")
     while True:
-        pregunta = input("Pregunta: ").strip()
+        try:
+            pregunta = input("Pregunta: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
         if pregunta.lower() in ("salir", "exit", "quit"):
             break
         if not pregunta:
             continue
 
-        respuesta = preguntar(pregunta, coleccion)
-        print(f"\nRespuesta: {respuesta}\n")
+        texto, fuentes = motor.preguntar(pregunta)
+        print(f"\n{NOMBRE_ASISTENTE}: {texto}")
+        if fuentes:
+            etiquetas = " · ".join(f"{f['archivo']} p.{f['pagina']}" for f in fuentes)
+            print(f"  [{etiquetas}]")
+        print()
