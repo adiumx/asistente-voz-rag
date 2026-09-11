@@ -23,7 +23,7 @@ install: install-system install-python install-models
 install-system:
 	@echo "Instalando dependencias del sistema..."
 	sudo apt-get update
-	sudo apt-get install -y $(PYTHON) $(PYTHON)-venv git curl espeak-ng portaudio19-dev
+	sudo apt-get install -y $(PYTHON) $(PYTHON)-venv $(PYTHON)-dev build-essential git curl espeak-ng portaudio19-dev
 	@echo "Instalando dependencias de Qt (interfaz gráfica del orbe)..."
 	sudo apt-get install -y libxcb-cursor0 libxkbcommon-x11-0
 	@if ! command -v ollama >/dev/null 2>&1; then \

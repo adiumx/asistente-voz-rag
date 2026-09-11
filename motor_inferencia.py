@@ -19,14 +19,16 @@ Protocolo por las colas (todo son tuplas, primer elemento = tipo de mensaje):
     ("ERROR_CARGA", mensaje)
     ("PREGUNTA", texto)
     ("RESPUESTA", texto, fuentes)
-    ("AUDIO", audio_numpy_float32, samplerate)
-    ("SIN_VOZ",)          # hubo respuesta pero no se sintetizó audio
+    ("AUDIO_TROZO", audio_numpy_float32, samplerate)  # uno por cada trozo de voz sintetizado
+    ("AUDIO_FIN",)        # marca que ya no vienen mas AUDIO_TROZO de este turno
+    ("SIN_VOZ",)          # hubo respuesta pero no se sintetizo audio
     ("VACIO",)            # no se entendió nada en la transcripción
     ("FIN_TURNO",)        # siempre se manda al terminar un ("TURNO", ...)
     ("ERROR_TURNO", mensaje)
     ("REINDEXADO", ok_bool, mensaje)
 """
 
+import time
 import os
 import re
 import shutil
@@ -94,9 +96,6 @@ def _preparar_ffmpeg():
 def ejecutar(cola_entrada, cola_salida):
     """Punto de entrada del proceso hijo. Bucle de vida completo."""
 
-    # Mismos mitigadores que probamos en el proceso principal; no cuestan nada
-    # tenerlos aquí también, y si el crash resulta ser justo eso, seguimos
-    # ganando estabilidad al tener el problema aislado en su propio proceso.
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -115,19 +114,28 @@ def ejecutar(cola_entrada, cola_salida):
         from consultar_rag import MotorRAG
 
         dispositivo = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"[diag] Whisper usara: {dispositivo}", flush=True)
         whisper_model = whisper.load_model(MODELO_WHISPER, device=dispositivo)
 
         try:
-            tts = KPipeline(lang_code=IDIOMA_TTS, device="cpu")
+            tts = KPipeline(lang_code=IDIOMA_TTS, device="cuda" if __import__("torch").cuda.is_available() else "cpu")
         except TypeError:
             tts = KPipeline(lang_code=IDIOMA_TTS)
 
         motor = MotorRAG()
         return motor.contar()
 
+    def reducir_ruido(audio_float32):
+        try:
+            import noisereduce as nr
+            return nr.reduce_noise(y=audio_float32, sr=16000, stationary=True)
+        except Exception:
+            return audio_float32
+
     def transcribir(audio_float32):
+        audio_limpio = reducir_ruido(audio_float32)
         r = whisper_model.transcribe(
-            audio_float32,
+            audio_limpio,
             language="es",
             fp16=False,
             condition_on_previous_text=False,
@@ -136,14 +144,20 @@ def ejecutar(cola_entrada, cola_salida):
         texto = (r.get("text") or "").strip()
         return "" if _es_alucinacion(texto) else texto
 
-    def sintetizar(texto):
+    def sintetizar_y_enviar(texto, cola_salida):
         limpio = _limpiar_para_voz(texto)
         if not limpio:
-            return None
-        trozos = [a for _, _, a in tts(limpio, voice=VOZ_TTS)]
-        if not trozos:
-            return None
-        return np.concatenate(trozos)
+            return False
+
+        algo_enviado = False
+        for _, _, audio_chunk in tts(limpio, voice=VOZ_TTS):
+            if audio_chunk is not None and len(audio_chunk) > 0:
+                cola_salida.put(("AUDIO_TROZO", audio_chunk, 24000))
+                algo_enviado = True
+
+        if algo_enviado:
+            cola_salida.put(("AUDIO_FIN",))
+        return algo_enviado
 
     # --- ciclo de vida ---
     try:
@@ -168,7 +182,7 @@ def ejecutar(cola_entrada, cola_salida):
                 import subprocess
                 import sys as _sys
                 subprocess.run([_sys.executable, "indexar_pdfs.py"], check=True)
-                motor = None  # se recreará solo en la próxima consulta
+                motor = None
                 from consultar_rag import MotorRAG
                 motor = MotorRAG()
                 cola_salida.put(("REINDEXADO", True, f"{motor.contar()} fragmentos"))
@@ -178,7 +192,9 @@ def ejecutar(cola_entrada, cola_salida):
         elif tipo == "TURNO":
             _, audio_float32, silenciado = msg
             try:
+                t0 = time.monotonic()
                 pregunta = transcribir(audio_float32)
+                print(f"[latencia-detalle] transcripcion: {time.monotonic()-t0:.2f}s", flush=True)
                 if not pregunta:
                     cola_salida.put(("VACIO",))
                     cola_salida.put(("FIN_TURNO",))
@@ -186,14 +202,16 @@ def ejecutar(cola_entrada, cola_salida):
 
                 cola_salida.put(("PREGUNTA", pregunta))
 
+                t1 = time.monotonic()
                 texto, fuentes = motor.preguntar(pregunta)
+                print(f"[latencia-detalle] rag + gemma: {time.monotonic()-t1:.2f}s", flush=True)
                 cola_salida.put(("RESPUESTA", texto, fuentes))
 
                 if not silenciado:
-                    audio = sintetizar(texto)
-                    if audio is not None:
-                        cola_salida.put(("AUDIO", audio, 24000))
-                    else:
+                    t2 = time.monotonic()
+                    hubo_audio = sintetizar_y_enviar(texto, cola_salida)
+                    print(f"[latencia-detalle] sintesis completa kokoro: {time.monotonic()-t2:.2f}s", flush=True)
+                    if not hubo_audio:
                         cola_salida.put(("SIN_VOZ",))
                 else:
                     cola_salida.put(("SIN_VOZ",))

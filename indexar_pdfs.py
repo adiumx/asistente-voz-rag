@@ -1,10 +1,11 @@
 """
-Indexa archivos PDF en una base de datos vectorial (ChromaDB) para usarlos
-como fuente de conocimiento en un pipeline RAG.
+Indexa archivos PDF y TXT en una base de datos vectorial (ChromaDB) para
+usarlos como fuente de conocimiento en un pipeline RAG.
 
 Uso:
-    python indexar_pdfs.py                  # indexa todos los PDF en ./documentos
-    python indexar_pdfs.py ruta/a/mi.pdf     # indexa un PDF específico
+    python indexar_pdfs.py                  # indexa todo lo soportado en ./documentos
+    python indexar_pdfs.py ruta/a/mi.pdf     # indexa un archivo específico
+    python indexar_pdfs.py ruta/a/mi.txt
 """
 
 import os
@@ -19,19 +20,39 @@ CARPETA_DB = "./chroma_db"
 COLECCION = "pdfs"
 EMBED_MODEL = "nomic-embed-text"
 
+EXTENSIONES_SOPORTADAS = (".pdf", ".txt")
+
 CHUNK_SIZE = 1000        # caracteres por chunk
 CHUNK_OVERLAP = 200      # solapamiento entre chunks consecutivos
 
 
-def extraer_texto_pdf(ruta_pdf):
-    """Extrae todo el texto de un PDF, página por página."""
-    reader = PdfReader(ruta_pdf)
+def extraer_texto_pdf(ruta):
+    """Extrae el texto de un PDF, página por página. Devuelve [(num_pagina, texto), ...]."""
+    reader = PdfReader(ruta)
     paginas = []
     for i, page in enumerate(reader.pages):
         texto = page.extract_text() or ""
         if texto.strip():
             paginas.append((i + 1, texto))
     return paginas
+
+
+def extraer_texto_txt(ruta):
+    """Lee un .txt completo. Los .txt no tienen 'páginas', así que todo va en una sola."""
+    # utf-8-sig quita el BOM si el archivo lo trae (común en archivos exportados de Windows)
+    with open(ruta, "r", encoding="utf-8-sig", errors="replace") as f:
+        texto = f.read()
+    return [(1, texto)] if texto.strip() else []
+
+
+def extraer_texto(ruta):
+    ext = os.path.splitext(ruta)[1].lower()
+    if ext == ".pdf":
+        return extraer_texto_pdf(ruta)
+    elif ext == ".txt":
+        return extraer_texto_txt(ruta)
+    else:
+        raise ValueError(f"Formato no soportado: {ext}")
 
 
 def trocear_texto(texto, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
@@ -53,11 +74,16 @@ def generar_id(archivo, pagina, chunk_idx):
     return hashlib.md5(base.encode()).hexdigest()
 
 
-def indexar_pdf(ruta_pdf, coleccion):
-    nombre_archivo = os.path.basename(ruta_pdf)
+def indexar_documento(ruta, coleccion):
+    nombre_archivo = os.path.basename(ruta)
     print(f"Procesando: {nombre_archivo}")
 
-    paginas = extraer_texto_pdf(ruta_pdf)
+    try:
+        paginas = extraer_texto(ruta)
+    except ValueError as e:
+        print(f"  -> Saltado: {e}")
+        return
+
     total_chunks = 0
 
     for num_pagina, texto_pagina in paginas:
@@ -80,7 +106,8 @@ def indexar_pdf(ruta_pdf, coleccion):
             )
             total_chunks += 1
 
-    print(f"  -> {len(paginas)} páginas, {total_chunks} fragmentos indexados")
+    unidad = "páginas" if ruta.lower().endswith(".pdf") else "bloques"
+    print(f"  -> {len(paginas)} {unidad}, {total_chunks} fragmentos indexados")
 
 
 def main():
@@ -89,25 +116,25 @@ def main():
     client = chromadb.PersistentClient(path=CARPETA_DB)
     coleccion = client.get_or_create_collection(COLECCION)
 
-    # Argumento opcional: un PDF específico
+    # Argumento opcional: un archivo específico
     if len(sys.argv) > 1:
         archivos = [sys.argv[1]]
     else:
         archivos = [
             os.path.join(CARPETA_DOCS, f)
             for f in os.listdir(CARPETA_DOCS)
-            if f.lower().endswith(".pdf")
+            if f.lower().endswith(EXTENSIONES_SOPORTADAS)
         ]
 
     if not archivos:
-        print(f"No se encontraron PDFs en {CARPETA_DOCS}")
-        print("Coloca tus archivos .pdf ahí, o pasa la ruta como argumento.")
+        print(f"No se encontraron PDF ni TXT en {CARPETA_DOCS}")
+        print("Coloca tus archivos .pdf o .txt ahí, o pasa la ruta como argumento.")
         return
 
     for ruta in archivos:
-        indexar_pdf(ruta, coleccion)
+        indexar_documento(ruta, coleccion)
 
-    print(f"\nListo. Total de documentos en la colección: {coleccion.count()}")
+    print(f"\nListo. Total de fragmentos en la colección: {coleccion.count()}")
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ Funciona en Windows y en Linux (X11). Ver notas de Wayland en el README.
 
 import os
 import sys
+import time
 import platform
 import multiprocessing as mp
 
@@ -30,7 +31,7 @@ from orbe import OrbeFlotante, PanelInfo
 
 ES_WINDOWS = platform.system() == "Windows"
 
-ATAJO = os.environ.get("MORITO_ATAJO", "ctrl+space")
+ATAJO = os.environ.get("MORITO_ATAJO", "ctrl+shift+space")
 
 FS = 16000
 FRAME_MS = 30
@@ -39,7 +40,7 @@ FRAME_SIZE = int(FS * FRAME_MS / 1000)
 SILENCIO_FIN_MS = 1100
 ESPERA_INICIAL_S = 6
 MAX_GRABACION_S = 25
-ENERGIA_MINIMA = 0.006
+ENERGIA_MINIMA = float(os.environ.get("MORITO_ENERGIA_MIN", "0.015"))  # sube si hay ruido de fondo constante (ej. ventilador de GPU)
 
 TIMEOUT_CARGA_S = 120   # la primera carga de modelos puede tardar
 TIMEOUT_TURNO_S = 60    # una respuesta completa no debería tardar mas que esto
@@ -63,7 +64,7 @@ class Trabajador(QObject):
 
     def __init__(self):
         super().__init__()
-        self.vad = webrtcvad.Vad(2)
+        self.vad = webrtcvad.Vad(3)  # más agresivo: mejor contra ruido de fondo constante
         self.silenciado = False
         self._ocupado = False
         self._cancelar_reproduccion = False
@@ -127,6 +128,7 @@ class Trabajador(QObject):
             return
         self._ocupado = True
         self._cancelar_reproduccion = False
+        self._primer_trozo_medido = False
 
         try:
             if self._reiniciar_proceso_si_murio():
@@ -139,9 +141,12 @@ class Trabajador(QObject):
 
             self.estado.emit("pensando")
             audio_float = audio.astype(np.float32) / 32768.0
+            self._t_fin_grabacion = time.monotonic()  # <-- marca de tiempo para medir latencia
             self.cola_entrada.put(("TURNO", audio_float, self.silenciado))
 
             self._recibir_turno()
+            total = time.monotonic() - self._t_fin_grabacion
+            print(f"[latencia] fin de grabación -> turno completo: {total:.2f}s")
             self.estado.emit("listo")
 
         except Exception as e:
@@ -169,10 +174,17 @@ class Trabajador(QObject):
             elif tipo == "RESPUESTA":
                 self.respuesta_lista.emit(msg[1], msg[2])
 
-            elif tipo == "AUDIO":
+            elif tipo == "AUDIO_TROZO":
                 if not self._cancelar_reproduccion:
+                    if not self._primer_trozo_medido:
+                        latencia = time.monotonic() - self._t_fin_grabacion
+                        print(f"[latencia] fin de grabación -> primer audio: {latencia:.2f}s")
+                        self._primer_trozo_medido = True
                     self.estado.emit("hablando")
                     self._reproducir(msg[1], msg[2])
+
+            elif tipo == "AUDIO_FIN":
+                pass  # ya se reprodujeron todos los trozos en orden
 
             elif tipo == "SIN_VOZ":
                 pass
@@ -373,8 +385,14 @@ class Morito(QObject):
 
     def _activar(self):
         if self._estado == "hablando":
+            # Corta la reproducción, pero NO forzamos self._estado aquí:
+            # el trabajador sigue "ocupado" cerrando el turno en segundo plano,
+            # y si dejáramos que un clic inmediato pidiera un turno nuevo,
+            # el trabajador lo ignoraría en silencio (seguía ocupado) y la
+            # app se quedaba como "trabada". El estado real llega solo,
+            # en cuanto el trabajador termina, vía la señal `estado`.
             self.trabajador.interrumpir()
-            self._cambio_estado("listo")
+            self.orbe.set_estado("listo")  # solo feedback visual, no cambia self._estado
             return
         if self._estado in ("listo", "error"):
             self.pedir_turno.emit()
